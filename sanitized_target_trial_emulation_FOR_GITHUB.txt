@@ -1,0 +1,318 @@
+# TARGET TRIAL EMULATION & PROPENSITY SCORE ANALYSIS PIPELINE
+# De-identified & Public GitHub Version
+# Target Trial Emulation: Pembrolizumab vs. Chemotherapy in dMMR/MSI-H mCRC
+# Statistical Approach: Truncated IPTW & IPTW-Weighted Outcome Regression
+
+# 1. LIBRARY LOADING & SETUP
+
+required_packages <- c(
+  "survival", "survminer", "survRM2", "WeightIt", "cobalt",
+  "survey", "adjustedCurves", "boot", "dplyr", "tidyr"
+)
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_packages) > 0) {
+  install.packages(new_packages)
+}
+
+library(survival)
+library(survminer)
+library(survRM2)
+library(WeightIt)
+library(cobalt)
+library(survey)
+library(adjustedCurves)
+library(boot)
+library(dplyr)
+library(tidyr)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Create directory for analytical outputs
+if (!dir.exists("TTE_outputs")) {
+  dir.create("TTE_outputs")
+}
+
+# 2. DATA INGESTION & DE-IDENTIFIED SCHEMA MAPPING
+
+
+pembro_path <- "data/pembro_deidentified.csv"
+chemo_path  <- "data/chemo_deidentified.csv"
+
+# Fallback to current directory if data/ folder not present
+if (!file.exists(pembro_path)) pembro_path <- "pembro_deidentified.csv"
+if (!file.exists(chemo_path))  chemo_path  <- "chemo_deidentified.csv"
+
+# Read datasets
+pembro_raw <- read.csv(pembro_path, stringsAsFactors = FALSE)
+chemo_raw  <- read.csv(chemo_path,  stringsAsFactors = FALSE)
+
+# Programmatic cleaning: Remove empty rows and duplicate patient IDs
+pembro <- pembro_raw %>%
+  filter(!is.na(patient_id) & patient_id != "")
+
+chemo <- chemo_raw %>%
+  filter(!is.na(patient_id) & patient_id != "") %>%
+  distinct(patient_id, .keep_all = TRUE)
+
+# 3. DATA HARMONIZATION & COHORT MERGING
+# Harmonize column names across cohorts
+common_cols <- intersect(names(pembro), names(chemo))
+
+pembro_matched <- pembro[, common_cols]
+chemo_matched  <- chemo[, common_cols]
+
+pembro_matched$treatment <- "Pembrolizumab"
+chemo_matched$treatment  <- "Chemotherapy"
+
+combined_raw <- rbind(pembro_matched, chemo_matched)
+
+# Standardize baseline covariates
+combined_raw <- combined_raw %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Chemotherapy", "Pembrolizumab")),
+    sex = trimws(as.character(sex)),
+    sex = factor(sex),
+    tumour_side = trimws(as.character(tumour_side)),
+    tumour_side = case_when(
+      tumour_side %in% c("R", "Right", "Ascending", "Caecum", "Hepatic flexure") ~ "Right",
+      tumour_side %in% c("L", "Left", "Descending", "Sigmoid") ~ "Left",
+      tumour_side == "Both" ~ "Both",
+      TRUE ~ NA_character_
+    ),
+    tumour_side = factor(tumour_side),
+    disease_timing = case_when(
+      disease_timing %in% c("Newly diagnosed metastatic", "Synchronous") ~ "Synchronous",
+      disease_timing %in% c("Recurrent / progressive disease", "Metachronous") ~ "Metachronous",
+      TRUE ~ NA_character_
+    ),
+    disease_timing = factor(disease_timing),
+    prev_systemic_therapy = case_when(
+      prev_systemic_therapy %in% c("Y", "Yes") ~ "Yes",
+      prev_systemic_therapy %in% c("N", "No") ~ "No",
+      TRUE ~ NA_character_
+    ),
+    prev_systemic_therapy = factor(prev_systemic_therapy),
+    kras = case_when(
+      kras %in% c("Y", "Yes", "Mutant") ~ "Mutant",
+      kras %in% c("N", "No", "WT", "Wildtype") ~ "Wildtype",
+      TRUE ~ "Unknown"
+    ),
+    kras = factor(kras),
+    nras = case_when(
+      nras %in% c("Y", "Yes", "Mutant") ~ "Mutant",
+      nras %in% c("N", "No", "WT", "Wildtype") ~ "Wildtype",
+      TRUE ~ "Unknown"
+    ),
+    nras = factor(nras),
+    braf = case_when(
+      braf %in% c("Y", "Yes", "V600E", "Mutant") ~ "Mutant",
+      braf %in% c("N", "No", "WT", "Wildtype") ~ "Wildtype",
+      TRUE ~ "Unknown"
+    ),
+    braf = factor(braf),
+    t_stage = case_when(
+      grepl("T4", t_stage, ignore.case = TRUE) ~ "T4",
+      grepl("T3", t_stage, ignore.case = TRUE) ~ "T3",
+      grepl("T1|T2", t_stage, ignore.case = TRUE) ~ "T1/T2",
+      TRUE ~ "Unknown"
+    ),
+    t_stage = factor(t_stage, levels = c("T3", "T4", "T1/T2", "Unknown")),
+    n_stage = case_when(
+      grepl("N2", n_stage, ignore.case = TRUE) ~ "N2",
+      grepl("N1", n_stage, ignore.case = TRUE) ~ "N1",
+      grepl("N0", n_stage, ignore.case = TRUE) ~ "N0",
+      TRUE ~ "Unknown"
+    ),
+    n_stage = factor(n_stage, levels = c("N0", "N1", "N2", "Unknown"))
+  )
+
+# Programmatically handle non-sensical negative time from diagnosis metrics
+if ("time_from_diagnosis_months" %in% names(combined_raw)) {
+  combined_raw$time_from_diagnosis_months <- ifelse(
+    !is.na(combined_raw$time_from_diagnosis_months) & combined_raw$time_from_diagnosis_months < 0,
+    NA,
+    combined_raw$time_from_diagnosis_months
+  )
+}
+
+# 4. PROPENSITY SCORE MODELING & IPTW WEIGHTING
+# Filter complete baseline cases for PS modeling
+ps_data <- combined_raw %>%
+  filter(!is.na(age) & !is.na(sex) & !is.na(tumour_side) & !is.na(disease_timing) & !is.na(prev_systemic_therapy))
+
+# Binary treatment variable (1 = Pembrolizumab, 0 = Chemotherapy)
+ps_data$treatment_num <- ifelse(ps_data$treatment == "Pembrolizumab", 1, 0)
+
+# Specification of Logistic Regression Propensity Score Model
+ps_model <- glm(
+  treatment_num ~ age + sex + tumour_side + disease_timing + prev_systemic_therapy + kras + braf,
+  family = binomial(link = "logit"),
+  data = ps_data
+)
+
+summary(ps_model)
+
+# Predict Propensity Scores
+ps_data$ps <- predict(ps_model, type = "response")
+
+# Calculate Marginal Probabilities & Stabilized IPTW Weights
+p_treated <- mean(ps_data$treatment_num == 1, na.rm = TRUE)
+p_control <- mean(ps_data$treatment_num == 0, na.rm = TRUE)
+
+ps_data$sw_raw <- ifelse(
+  ps_data$treatment_num == 1,
+  p_treated / ps_data$ps,
+  p_control / (1 - ps_data$ps)
+)
+
+# Truncate Stabilized IPTW Weights at 1st and 99th Percentiles to Control Extreme Weights
+trunc_bounds <- quantile(ps_data$sw_raw, probs = c(0.01, 0.99), na.rm = TRUE)
+ps_data$sw_trunc <- pmin(pmax(ps_data$sw_raw, trunc_bounds[1]), trunc_bounds[2])
+
+# Assess Covariate Balance (Love Plot & Standardized Mean Differences)
+bal_tab <- bal.tab(
+  treatment_num ~ age + sex + tumour_side + disease_timing + prev_systemic_therapy + kras + braf,
+  data = ps_data,
+  weights = ps_data$sw_trunc,
+  method = "weighting",
+  estimand = "ATE",
+  un = TRUE
+)
+
+print(bal_tab)
+
+# Save Love Plot to File
+pdf("TTE_outputs/love_plot_covariate_balance.pdf", width = 8, height = 6)
+love.plot(
+  bal_tab,
+  threshold = 0.1,
+  abs = TRUE,
+  var.order = "unadjusted",
+  sample.names = c("Unweighted", "IPTW Truncated (1st/99th)"),
+  stars = "raw",
+  title = "Covariate Balance Before and After Truncated IPTW"
+)
+dev.off()
+
+# 5. OUTCOME ANALYSES (IPTW-WEIGHTED OUTCOME REGRESSION WITH AGE ADJUSTMENT)
+#  A. Progression-Free Survival (PFS) - IPTW-only vs IPTW + Age Adjusted Cox Models
+cox_pfs_iptw <- coxph(
+  Surv(pfs_months, pfs_event) ~ treatment,
+  data = ps_data,
+  weights = sw_trunc,
+  robust = TRUE
+)
+
+# Primary Model: IPTW-weighted outcome regression with additional adjustment for age
+cox_pfs_adj <- coxph(
+  Surv(pfs_months, pfs_event) ~ treatment + age,
+  data = ps_data,
+  weights = sw_trunc,
+  robust = TRUE
+)
+
+cat("\n--- PFS: IPTW-Weighted Outcome Regression with Additional Adjustment for Age ---\n")
+print(summary(cox_pfs_adj))
+
+# Check Proportional Hazards Assumption
+ph_test_pfs <- cox.zph(cox_pfs_adj)
+print(ph_test_pfs)
+
+# Weighted Kaplan-Meier for PFS
+km_pfs_weighted <- survfit(
+  Surv(pfs_months, pfs_event) ~ treatment,
+  data = ps_data,
+  weights = sw_trunc
+)
+
+# Save PFS Survival Curves
+pdf("TTE_outputs/pfs_weighted_km_curve.pdf", width = 9, height = 7)
+ggsurvplot(
+  km_pfs_weighted,
+  data = ps_data,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = FALSE,
+  censor = TRUE,
+  surv.median.line = "hv",
+  xlab = "Time from Treatment Initiation (Months)",
+  ylab = "Progression-Free Survival Probability",
+  xlim = c(0, 36),
+  break.time.by = 6,
+  legend.title = "Treatment Arm",
+  legend.labs = c("Chemotherapy", "Pembrolizumab"),
+  ggtheme = theme_bw()
+)
+dev.off()
+
+# B. Restricted Mean Survival Time (RMST) for PFS at 24 Months
+rmst_boot_pfs <- function(data, indices) {
+  d <- data[indices, ]
+  fit <- survfit(Surv(pfs_months, pfs_event) ~ treatment, data = d, weights = sw_trunc)
+  tab <- summary(fit, rmean = 24)$table
+  rmst_chemo  <- tab["treatment=Chemotherapy", "rmean"]
+  rmst_pembro <- tab["treatment=Pembrolizumab", "rmean"]
+  return(rmst_pembro - rmst_chemo)
+}
+
+boot_res_pfs <- boot(data = ps_data, statistic = rmst_boot_pfs, R = 1000)
+boot_ci_pfs  <- boot.ci(boot_res_pfs, type = "perc")
+cat("\n--- RMST Difference at 24 Months (PFS) ---\n")
+print(boot_res_pfs)
+print(boot_ci_pfs)
+
+# C. Overall Survival (OS) - IPTW-Weighted Outcome Regression with Age Adjustment
+cox_os_adj <- coxph(
+  Surv(os_months, os_event) ~ treatment + age,
+  data = ps_data,
+  weights = sw_trunc,
+  robust = TRUE
+)
+
+cat("\n--- OS: IPTW-Weighted Outcome Regression with Additional Adjustment for Age ---\n")
+print(summary(cox_os_adj))
+
+# D. Progression-Free Survival 2 (PFS2) - IPTW-Weighted Outcome Regression with Age Adjustment
+cox_pfs2_adj <- coxph(
+  Surv(pfs2_months, pfs2_event) ~ treatment + age,
+  data = ps_data,
+  weights = sw_trunc,
+  robust = TRUE
+)
+
+cat("\n--- PFS2: IPTW-Weighted Outcome Regression with Additional Adjustment for Age ---\n")
+print(summary(cox_pfs2_adj))
+
+# 6. SECONDARY BINARY OUTCOMES & SAFETY ANALYSIS (SURVEY GLM)
+survey_design <- svydesign(
+  ids = ~1,
+  weights = ~sw_trunc,
+  data = ps_data
+)
+
+# Overall Response Rate (ORR) Weighted Analysis
+orr_model <- svyglm(orr ~ treatment, design = survey_design, family = quasibinomial(link = "logit"))
+cat("\n--- ORR Weighted Survey GLM ---\n")
+print(summary(orr_model))
+print(exp(cbind(OR = coef(orr_model), confint(orr_model))))
+
+# Grade >= 3 TRAE Safety Comparison
+g3_model <- svyglm(grade3_trae ~ treatment, design = survey_design, family = quasibinomial(link = "logit"))
+cat("\n--- Grade 3+ TRAE Weighted Model ---\n")
+print(summary(g3_model))
+
+#  7. SAVE SANITIZED ANALYSIS SUMMARY TABLES
+
+summary_adj <- summary(cox_pfs_adj)
+pfs_res_df <- data.frame(
+  Model = "IPTW-weighted outcome regression with additional adjustment for age (PFS)",
+  HR = exp(coef(cox_pfs_adj)["treatmentPembrolizumab"]),
+  Lower_95 = exp(confint(cox_pfs_adj)["treatmentPembrolizumab", 1]),
+  Upper_95 = exp(confint(cox_pfs_adj)["treatmentPembrolizumab", 2]),
+  P_Value = summary_adj$coefficients["treatmentPembrolizumab", "Pr(>|z|)"]
+)
+
+write.csv(pfs_res_df, "TTE_outputs/pfs_analysis_summary.csv", row.names = FALSE)
+cat("\n[SUCCESS] Pipeline execution complete. All outputs saved to TTE_outputs/\n")
